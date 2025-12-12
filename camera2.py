@@ -1,24 +1,66 @@
 import cv2
-import numpy as np
+import threading
 import time
 import datetime
 import json
-import os
+import numpy as np
 from ultralytics import YOLO
 import supervision as sv
 
 # -------------------------------------------------------
-# [로그 저장 함수] 파일 이어쓰기 (JSONL 방식) - 성능 최적화
+# [클래스] RTSP 영상 읽기 최적화 (스레딩 적용)
+# -------------------------------------------------------
+class FreshFrameReader:
+    def __init__(self, src):
+        self.cap = cv2.VideoCapture(src)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # 버퍼 크기를 1로 제한
+        self.frame = None
+        self.ret = False
+        self.stopped = False
+        self.lock = threading.Lock()
+        
+        # 백그라운드에서 영상을 계속 읽어오는 스레드 시작
+        self.t = threading.Thread(target=self._update, daemon=True)
+        self.t.start()
+
+    def _update(self):
+        while not self.stopped:
+            ret, frame = self.cap.read()
+            if not ret:
+                self.stopped = True
+                break
+            # 항상 가장 최신 프레임만 보관 (Lock 사용으로 충돌 방지)
+            with self.lock:
+                self.ret = ret
+                self.frame = frame
+            # CPU 점유율 과부하 방지용 미세 대기
+            time.sleep(0.001) 
+
+    def read(self):
+        # 메인 루프에서 호출 시, 쌓인 버퍼가 아닌 '현재 시점'의 프레임 리턴
+        with self.lock:
+            if self.frame is None:
+                return False, None
+            # 프레임 복사본 전달 (스레드 간 데이터 오염 방지)
+            return self.ret, self.frame.copy()
+
+    def release(self):
+        self.stopped = True
+        self.t.join()
+        self.cap.release()
+
+# -------------------------------------------------------
+# [로그 저장 함수] 파일 이어쓰기 (JSONL 방식)
 # -------------------------------------------------------
 def save_log_append(filename, log_data):
     """
-    로그를 파일 끝에 한 줄씩 추가합니다 (Append 모드).
-    파일이 커져도 매번 전체를 읽고 쓰지 않으므로 영상 끊김(Lag)을 방지합니다.
+    로그를 파일 끝에 한 줄씩 추가합니다.
+    매번 파일을 새로 쓰지 않아 영상 끊김(Lag)을 방지
     """
     try:
         with open(filename, 'a', encoding='utf-8') as f:
             json.dump(log_data, f, ensure_ascii=False)
-            f.write('\n') # 로그 한 줄마다 줄바꿈
+            f.write('\n') 
     except Exception as e:
         print(f"[오류] 로그 저장 실패: {e}")
 
@@ -55,7 +97,7 @@ def main():
     # 1. 설정 변수
     # ==========================================
     # RTSP 주소 
-    RTSP_URL = "rtsp://hyun00:hyun0000@172.25.86.124/stream1"
+    RTSP_URL = "rtsp://hyun00:hyun0000@172.25.85.156/stream1"
     
     WARNING_TIME = 5        # (초) 나홀로 작업 경고 기준 시간
     FRAME_SKIP_INTERVAL = 3 # 3프레임마다 1번 처리 (부하 감소)
@@ -68,9 +110,9 @@ def main():
     # 2. 감지 구역(Polygon) 좌표 정의
     # ==========================================
     polygons = [
-        np.array([[48, 222], [328, 220], [306, 612], [48, 652]]),   # 1번 구역
-        np.array([[600, 100], [1000, 100], [1000, 500], [600, 500]]), # 2번 구역
-        np.array([[1100, 100], [1500, 100], [1500, 500], [1100, 500]]) # 3번 구역
+        np.array([[544, 148], [540, 550], [846, 578], [878, 170]]),   # 1번 구역
+        np.array([[910, 188], [884, 586], [1256, 616], [1326, 230]]), # 2번 구역
+        np.array([[1348, 234], [1284, 622], [1574, 636], [1646, 276]]) # 3번 구역
     ]
 
     # 구역별 타이머 (나홀로 작업 감지용)
@@ -84,8 +126,10 @@ def main():
         print(f"❌ 모델 로드 실패: {e}")
         return
     
-    cap = cv2.VideoCapture(RTSP_URL)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # [수정됨] 일반 cv2.VideoCapture 대신 최적화된 FreshFrameReader 사용
+    cap = FreshFrameReader(RTSP_URL)
+    # 스레드가 영상을 읽을 시간을 잠시 줌
+    time.sleep(1.0) 
     
     # ==========================================
     # 3. Supervision 설정
@@ -117,16 +161,23 @@ def main():
     print("시스템 시작됨. 종료하려면 'q'를 누르세요.")
 
     while True:
+        # [수정됨] 스레드에서 최신 프레임 가져오기 (버퍼 지연 없음)
         ret, frame = cap.read()
-        if not ret: break
+        
+        # 영상이 아직 준비 안 됐거나 끊긴 경우 대기
+        if not ret or frame is None:
+            time.sleep(0.01)
+            continue
 
         frame_count += 1
+        # 프레임 스킵 (추론 부하 감소용, 백그라운드 영상 읽기는 계속됨)
         if frame_count % FRAME_SKIP_INTERVAL != 0:
             continue
 
         # ------------------------------------------------------
         # A. 추적 및 전역(Global) 감지
         # ------------------------------------------------------
+        # persist=True는 ID 추적을 위해 필수
         results = model.track(frame, persist=True, verbose=False, imgsz=640)
         detections = sv.Detections.from_ultralytics(results[0])
 
@@ -135,12 +186,11 @@ def main():
             detections = detections[(detections.class_id == CLASS_ID_HELMET) | (detections.class_id == CLASS_ID_NO_HELMET)]
 
         # --- [로직 1: 전체 화면 헬멧 미착용 감지] ---
-        # 구역 상관없이 화면 전체에서 'No Helmet' 개수 파악
         global_no_helmet_detections = detections[detections.class_id == CLASS_ID_NO_HELMET]
         global_no_helmet_count = len(global_no_helmet_detections)
 
         if global_no_helmet_count > 0:
-            # 화면 경고 (OpenCV putText는 한글 지원이 안 되므로 영문 표기)
+            # 화면 경고 (OpenCV putText는 한글 지원 안됨)
             cv2.putText(frame, f"WARNING: NO HELMET ({global_no_helmet_count})", (50, 80), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
             
@@ -155,7 +205,6 @@ def main():
             is_inside_mask = zone.trigger(detections=detections)
             zone_detections = detections[is_inside_mask]
 
-            # 구역 내 총 인원 수 계산
             person_count_in_zone = len(zone_detections)
             
             status_text = ""
@@ -187,10 +236,8 @@ def main():
                     status_text = "TEAM OK"
 
             # --- [시각화: 구역] ---
-            # 구역 다각형 그리기
             zone_annotators[i].annotate(scene=frame)
             
-            # 구역 상태 텍스트 표시
             text_pos = (polygons[i][0][0], polygons[i][0][1] - 10)
             cv2.putText(frame, f"Zone {i+1}: {person_count_in_zone}P {status_text}", 
                         text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
@@ -198,14 +245,12 @@ def main():
         # ------------------------------------------------------
         # C. 전체 시각화 (박스 및 라벨)
         # ------------------------------------------------------
-        # 라벨 생성: "Helmet 0.95" 등
         labels = [
             f"{model.model.names[class_id]} {confidence:.2f}"
             for class_id, confidence
             in zip(detections.class_id, detections.confidence)
         ]
 
-        # 화면 전체의 객체(구역 내/외 모두) 박스 그리기
         frame = box_annotator.annotate(scene=frame, detections=detections)
         frame = label_annotator.annotate(scene=frame, detections=detections, labels=labels)
 
